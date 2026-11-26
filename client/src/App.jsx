@@ -4,7 +4,6 @@ import { io } from 'socket.io-client';
 import Auth from './Auth.jsx';
 
 const API_URL = 'http://localhost:5000';
-const socket = io(API_URL);
 
 export default function App() {
   const [token, setToken] = useState(localStorage.getItem('token') || '');
@@ -22,43 +21,89 @@ export default function App() {
   const [inviteCode, setInviteCode] = useState('');
   const [text, setText] = useState('');
   const [file, setFile] = useState(null);
+
+  const socketRef = useRef(null);
+  const fileInputRef = useRef(null);
   const messagesEndRef = useRef(null);
 
   const authHeaders = { headers: { Authorization: `Bearer ${token}` } };
 
   useEffect(() => {
-    if (token) fetchGroups();
-  }, [token]);
+    if (!token) return;
 
-  useEffect(() => {
-    socket.on('receive_message', (msg) => {
-      if (activeGroup && msg.group_id === activeGroup.group_id) {
-        setMessages((prev) => [...prev, msg]);
-      } else {
-        setUnread((prev) => ({ ...prev, [msg.group_id]: (prev[msg.group_id] || 0) + 1 }));
-      }
-    });
+    const socket = io(API_URL, { auth: { token } });
+    socketRef.current = socket;
 
-    socket.on('member_removed', ({ userId }) => {
-      if (user && userId === user.user_id) {
-        alert('You were removed from this group by an admin.');
-        setActiveGroup(null);
-        fetchGroups();
-      } else {
-        setMembers((prev) => prev.filter((m) => m.user_id !== userId));
-      }
+    socket.on('connect', () => {
+      fetchGroups();
     });
 
     return () => {
-      socket.off('receive_message');
-      socket.off('member_removed');
+      socket.disconnect();
+      socketRef.current = null;
     };
-  }, [activeGroup, user]);
+  }, [token]);
+
+  useEffect(() => {
+    const socket = socketRef.current;
+    if (!socket) return;
+
+    const handleReceiveMessage = (msg) => {
+      if (activeGroup && msg.group_id === activeGroup.group_id) {
+        setMessages((prev) =>
+          prev.some((m) => m.message_id === msg.message_id) ? prev : [...prev, msg]
+        );
+      } else {
+        setUnread((prev) => ({ ...prev, [msg.group_id]: (prev[msg.group_id] || 0) + 1 }));
+      }
+    };
+
+    const handleMemberJoined = ({ groupId, member }) => {
+      if (activeGroup && activeGroup.group_id === groupId) {
+        setMembers((prev) =>
+          prev.some((m) => m.user_id === member.user_id) ? prev : [...prev, member]
+        );
+      }
+    };
+
+    const handleMemberRemoved = ({ groupId, userId }) => {
+      if (user && userId === user.user_id) {
+        alert('You were removed from this group.');
+        if (activeGroup?.group_id === groupId) setActiveGroup(null);
+        fetchGroups();
+      } else if (activeGroup && activeGroup.group_id === groupId) {
+        setMembers((prev) => prev.filter((m) => m.user_id !== userId));
+      }
+    };
+
+    const handleAdminChanged = ({ groupId, newAdminId }) => {
+      if (activeGroup && activeGroup.group_id === groupId) {
+        setMembers((prev) =>
+          prev.map((m) => (m.user_id === newAdminId ? { ...m, role: 'admin' } : m))
+        );
+        if (user && newAdminId === user.user_id) {
+          setMyRole('admin');
+        }
+      }
+      fetchGroups();
+    };
+
+    socket.on('receive_message', handleReceiveMessage);
+    socket.on('member_joined', handleMemberJoined);
+    socket.on('member_removed', handleMemberRemoved);
+    socket.on('admin_changed', handleAdminChanged);
+
+    return () => {
+      socket.off('receive_message', handleReceiveMessage);
+      socket.off('member_joined', handleMemberJoined);
+      socket.off('member_removed', handleMemberRemoved);
+      socket.off('admin_changed', handleAdminChanged);
+    };
+  }, [activeGroup, user, token]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
-
   const logout = () => {
     localStorage.clear();
     setToken('');
@@ -67,15 +112,23 @@ export default function App() {
   };
 
   const fetchGroups = async () => {
-    const res = await axios.get(`${API_URL}/api/groups`, authHeaders);
-    setGroups(res.data);
-    res.data.forEach((g) => socket.emit('join_group', g.group_id));
+    try {
+      const res = await axios.get(`${API_URL}/api/groups`, authHeaders);
+      setGroups(res.data);
+      res.data.forEach((g) => socketRef.current?.emit('join_group', g.group_id));
+    } catch (err) {
+      if (err.response?.status === 401 || err.response?.status === 403) logout();
+    }
   };
 
   const createGroup = async (e) => {
     e.preventDefault();
     if (!newGroupName.trim()) return;
-    await axios.post(`${API_URL}/api/groups`, { group_name: newGroupName, description: newGroupDesc }, authHeaders);
+    await axios.post(
+      `${API_URL}/api/groups`,
+      { group_name: newGroupName, description: newGroupDesc },
+      authHeaders
+    );
     setNewGroupName('');
     setNewGroupDesc('');
     fetchGroups();
@@ -84,17 +137,19 @@ export default function App() {
   const joinGroup = async (e) => {
     e.preventDefault();
     try {
-      await axios.post(`${API_URL}/api/groups/join`, { invite_code: inviteCode }, authHeaders);
+      const res = await axios.post(`${API_URL}/api/groups/join`, { invite_code: inviteCode }, authHeaders);
       setInviteCode('');
-      fetchGroups();
+      await fetchGroups();
+      if (res.data.group) selectGroup(res.data.group);
     } catch (err) {
       alert(err.response?.data?.error || 'Failed to join');
     }
   };
+
   const selectGroup = async (group) => {
     setActiveGroup(group);
     setUnread((prev) => ({ ...prev, [group.group_id]: 0 }));
-    socket.emit('join_group', group.group_id);
+    socketRef.current?.emit('join_group', group.group_id);
     const res = await axios.get(`${API_URL}/api/groups/${group.group_id}/details`, authHeaders);
     setMessages(res.data.messages);
     setMembers(res.data.members);
@@ -105,24 +160,27 @@ export default function App() {
     e.preventDefault();
     if (!text.trim() && !file) return;
 
-    let attachment = null;
-    if (file) {
-      const formData = new FormData();
-      formData.append('file', file);
-      const uploadRes = await axios.post(`${API_URL}/api/upload`, formData, authHeaders);
-      attachment = uploadRes.data;
+    try {
+      let attachment = null;
+      if (file) {
+        const formData = new FormData();
+        formData.append('file', file);
+        const uploadRes = await axios.post(`${API_URL}/api/upload`, formData, authHeaders);
+        attachment = uploadRes.data;
+      }
+
+      socketRef.current?.emit('send_message', {
+        group_id: activeGroup.group_id,
+        message_text: text,
+        attachment
+      });
+
+      setText('');
+      setFile(null);
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    } catch (err) {
+      alert(err.response?.data?.error || 'Failed to send message');
     }
-
-    socket.emit('send_message', {
-      group_id: activeGroup.group_id,
-      sender_id: user.user_id,
-      sender_name: user.name,
-      message_text: text,
-      attachment
-    });
-
-    setText('');
-    setFile(null);
   };
 
   const removeMember = async (memberId) => {
@@ -214,7 +272,13 @@ export default function App() {
               </div>
 
               <form onSubmit={sendMessage} className="p-2 border-top bg-white d-flex gap-2 align-items-center">
-                <input type="file" className="form-control form-control-sm" style={{ maxWidth: '200px' }} onChange={(e) => setFile(e.target.files[0])} />
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  className="form-control form-control-sm"
+                  style={{ maxWidth: '200px' }}
+                  onChange={(e) => setFile(e.target.files)}
+                />
                 <input className="form-control" placeholder="Type a message..." value={text} onChange={(e) => setText(e.target.value)} />
                 <button className="btn btn-primary">Send</button>
               </form>
@@ -250,4 +314,3 @@ export default function App() {
     </div>
   );
 }
-
